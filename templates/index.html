@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Automatizador de Planilhas Excel</title>
+    <style>
+        /* Estilos de layout e tipografia */
+        body { font-family: 'Inter', sans-serif; padding: 20px; background-color: #f4f7f9; }
+        .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background: white; 
+            padding: 30px; 
+            border-radius: 12px; 
+            box-shadow: 0 6px 15px rgba(0,0,0,0.1); 
+            border-top: 5px solid #007bff;
+        }
+        h1 { color: #007bff; font-size: 1.8rem; margin-bottom: 5px; }
+        p { color: #555; margin-bottom: 25px; }
+        label { display: block; font-weight: 600; margin-bottom: 8px; color: #333; }
+        
+        /* Contêiner Dinâmico de Linhas */
+        #upload-entries { margin-bottom: 25px; }
+        .upload-row { 
+            display: flex; 
+            gap: 15px; 
+            align-items: flex-end; /* Alinha os botões com o campo de seleção */
+            margin-bottom: 15px; 
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: #fcfcfc;
+        }
+        .upload-row > div { flex-grow: 1; }
+        
+        /* Estilizando Inputs e Selects */
+        select, input[type="file"] { 
+            width: 100%; 
+            padding: 10px; 
+            box-sizing: border-box; 
+            border: 1px solid #ccc; 
+            border-radius: 6px;
+            background-color: #fff;
+        }
+        input[type="file"] { padding: 8px; }
+
+        /* Botões de Ação */
+        .action-buttons { display: flex; gap: 10px; }
+        .action-buttons button { 
+            padding: 10px; 
+            border: none; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-size: 1em;
+            height: 40px; /* Altura fixa */
+            width: 40px; 
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+        #add-entry { background-color: #007bff; color: white; }
+        #add-entry:hover { background-color: #0056b3; }
+        .remove-entry { background-color: #dc3545; color: white; }
+        .remove-entry:hover { background-color: #c82333; }
+
+        /* Botão principal de envio */
+        #submit-button { 
+            display: block; 
+            width: 100%; 
+            padding: 14px; 
+            margin-top: 20px;
+            background-color: #28a745; 
+            color: white; 
+            border: none; 
+            cursor: pointer;
+            font-size: 1.1rem;
+            font-weight: 700;
+            border-radius: 8px;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 4px #1e7e34;
+        }
+        #submit-button:hover { background-color: #1e7e34; transform: translateY(1px); }
+        
+        /* Mensagens */
+        .loading, .error { padding: 10px; margin-top: 15px; border-radius: 4px; font-weight: bold; }
+        .loading { display: none; color: #007bff; background-color: #e6f7ff; border: 1px solid #b3e0ff; }
+        .error { display: none; color: #dc3545; background-color: #f8d7da; border: 1px solid #f5c6cb; }
+        .note { font-size: 0.85em; color: #888; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Automatizador de Planilhas</h1>
+        <p>Defina as configurações (Marketplace e Conta) para cada lote de arquivos Excel. Os dados serão combinados em um único arquivo de saída.</p>
+        
+        <form id="uploadForm" action="/processar" method="post" enctype="multipart/form-data">
+            
+            <div id="upload-entries">
+                <!-- Linhas de upload serão inseridas aqui pelo JavaScript -->
+            </div>
+
+            <div class="action-buttons">
+                <!-- Botão para adicionar mais configurações -->
+                <button type="button" id="add-entry" title="Adicionar novo grupo de arquivos">+</button>
+            </div>
+            
+            <button type="submit" id="submit-button">Processar e Baixar Arquivo Combinado</button>
+        </form>
+
+        <p class="loading" id="loadingMessage">Processando múltiplos arquivos... Por favor, aguarde.</p>
+        <p class="error" id="errorMessage"></p>
+    </div>
+
+    <!-- TEMPLATE OCULTO PARA NOVA LINHA DE UPLOAD -->
+    <template id="upload-template">
+        <div class="upload-row">
+            <!-- 1. Marketplace -->
+            <div>
+                <label>Marketplace</label>
+                <select class="marketplace-select" required>
+                    <option value="">-- Selecione --</option>
+                    <option value="Mercado Livre">Mercado Livre</option>
+                    <option value="Shein">Shein</option>
+                    <option value="Shopee">Shopee</option>
+                    <option value="Amazon">Amazon</option>
+                </select>
+            </div>
+
+            <!-- 2. Conta -->
+            <div>
+                <label>Conta</label>
+                <select class="conta-select" required>
+                    <option value="">-- Selecione --</option>
+                    <option value="Via Flix (Matriz)">Via Flix (Matriz)</option>
+                    <option value="Gs Torneiras">Gs Torneiras</option>
+                    <option value="Decarion (Monaco Metais)">Decarion (Monaco Metais)</option>
+                </select>
+            </div>
+
+            <!-- 3. Arquivos -->
+            <div>
+                <label>Arquivos Excel (.xlsx)</label>
+                <!-- NOTE: O name será definido dinamicamente pelo JS -->
+                <input type="file" class="file-input" accept=".xlsx" multiple required>
+                <div class="note">Arquivos para este Marketplace/Conta</div>
+            </div>
+
+            <!-- Botão de Remover -->
+            <div class="action-buttons" style="width: auto;">
+                <button type="button" class="remove-entry" title="Remover grupo de arquivos">X</button>
+            </div>
+        </div>
+    </template>
+
+
+    <script>
+        const form = document.getElementById('uploadForm');
+        const entriesContainer = document.getElementById('upload-entries');
+        const addEntryButton = document.getElementById('add-entry');
+        const template = document.getElementById('upload-template');
+        const loading = document.getElementById('loadingMessage');
+        const errorDiv = document.getElementById('errorMessage');
+
+        let entryCount = 0; // Contador para garantir nomes de input únicos
+
+        function addUploadEntry() {
+            const clone = template.content.cloneNode(true);
+            const row = clone.querySelector('.upload-row');
+            const fileInput = row.querySelector('.file-input');
+            const removeButton = row.querySelector('.remove-entry');
+            
+            // Define names únicos para os inputs de arquivo
+            fileInput.name = `files_${entryCount}[]`;
+            
+            // Adiciona o event listener para remover a linha
+            removeButton.addEventListener('click', () => {
+                row.remove();
+                if (entriesContainer.children.length === 0) {
+                    addUploadEntry(); // Garante que sempre há pelo menos um campo
+                }
+            });
+
+            entriesContainer.appendChild(clone);
+            entryCount++;
+        }
+
+        // Adiciona o primeiro campo ao carregar
+        if (entriesContainer.children.length === 0) {
+            addUploadEntry();
+        }
+
+        addEntryButton.addEventListener('click', addUploadEntry);
+
+        // Lógica de Submissão do Formulário
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            // 1. Coleta os dados dinamicamente
+            const formData = new FormData();
+            const rows = entriesContainer.querySelectorAll('.upload-row');
+
+            if (rows.length === 0) {
+                errorDiv.textContent = "Adicione pelo menos um grupo de arquivos.";
+                errorDiv.style.display = 'block';
+                return;
+            }
+
+            let valid = true;
+            rows.forEach((row, index) => {
+                const marketplace = row.querySelector('.marketplace-select').value;
+                const conta = row.querySelector('.conta-select').value;
+                const files = row.querySelector('.file-input').files;
+
+                if (!marketplace || !conta || files.length === 0) {
+                    valid = false;
+                    return;
+                }
+
+                // Adiciona os dados ao FormData
+                formData.append(`marketplace_${index}`, marketplace);
+                formData.append(`conta_selecionada_${index}`, conta);
+                
+                for (let i = 0; i < files.length; i++) {
+                    // Renomeia o input para o nome dinâmico para o backend
+                    formData.append(`files_${index}[]`, files[i]);
+                }
+            });
+
+            if (!valid) {
+                errorDiv.textContent = "Preencha todos os campos e selecione os arquivos em cada grupo.";
+                errorDiv.style.display = 'block';
+                return;
+            }
+
+            errorDiv.style.display = 'none';
+            loading.style.display = 'block';
+
+            try {
+                // 2. Envia os dados
+                const response = await fetch(form.action, {
+                    method: 'POST',
+                    body: formData, // Usa o FormData construído dinamicamente
+                });
+
+                loading.style.display = 'none';
+
+                if (response.ok) {
+                    // 3. Processa o download
+                    const blob = await response.blob();
+                    const disposition = response.headers.get('Content-Disposition');
+                    
+                    let filename = 'planilha_combinada.xlsx'; 
+                    if (disposition && disposition.indexOf('attachment') !== -1) {
+                        const filenameMatch = disposition.match(/filename="?(.+)"?$/);
+                        if (filenameMatch && filenameMatch[1]) {
+                            filename = filenameMatch[1].replace(/['"]/g, ''); 
+                        }
+                    }
+
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    
+                } else {
+                    const errorText = await response.text();
+                    errorDiv.textContent = `Erro no Processamento: ${errorText}`;
+                    errorDiv.style.display = 'block';
+                }
+            } catch (error) {
+                loading.style.display = 'none';
+                errorDiv.textContent = `Erro de Conexão: O servidor não respondeu. (${error.message})`;
+                errorDiv.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
