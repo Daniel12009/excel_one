@@ -1,503 +1,351 @@
-# app.py
-from flask import Flask, render_template, request, send_file
+# app.py (Versão 7.1 - Correção da Propagação do Carrinho)
+from flask import Flask, render_template, request, send_file, session
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font, NamedStyle
+from openpyxl.formatting.rule import Rule
+from openpyxl.styles.differential import DifferentialStyle
 import io
 import numpy as np 
-from decimal import Decimal, ROUND_HALF_UP 
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+import re
+import os 
 
 app = Flask(__name__)
-# Aumenta o limite para múltiplos arquivos
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 * 5 
+TEMP_FILE_NAME = 'planilha_combinada_temp.xlsx'
+
+
+# --- Funções Helper (Auxiliares) ---
+
+def safe_decimal(value):
+    """ (V6.2 - Robusta) """
+    if pd.isna(value): return Decimal('0')
+    if isinstance(value, Decimal): return value
+    if isinstance(value, (int, float)): return Decimal(str(value)) 
+    try:
+        clean_value = str(value).strip().replace('R$', '').replace(' ', '')
+        if '.' in clean_value and ',' in clean_value:
+            clean_value = clean_value.replace('.', '') 
+            clean_value = clean_value.replace(',', '.') 
+        elif ',' in clean_value:
+            clean_value = clean_value.replace(',', '.') 
+        if clean_value in ('', '-'): return Decimal('0')
+        return Decimal(clean_value)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('0')
+
+
+def to_float_exact(value):
+    if not isinstance(value, Decimal):
+        value = safe_decimal(value)
+    quantized = value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return float(quantized)
+
+def format_excel_output(output_stream):
+    """ (Sem alterações - Mantida formatação original) """
+    wb = load_workbook(output_stream)
+    ws = wb.active 
+    alignment_center = Alignment(horizontal='center', vertical='center')
+    header_font = Font(bold=True)
+    format_brl = '#,##0.00' 
+    format_int = '0'
+    brl_columns = ['Preço unitário...', 'Receita por produtos (BRL)', 'Envio Seller', 'TARIFA', 'Tarifa de venda...']
+    int_columns = ['Unidades']
+    brl_col_indices = []
+    int_col_indices = []
+
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.alignment = alignment_center
+        if cell.value in brl_columns:
+            brl_col_indices.append(cell.column)
+        if cell.value in int_columns:
+            int_col_indices.append(cell.column)
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = alignment_center
+            if cell.column in brl_col_indices:
+                cell.number_format = format_brl
+            elif cell.column in int_col_indices:
+                cell.number_format = format_int
+
+    for col in ws.columns:
+        max_length = 0
+        column_letter = get_column_letter(col[0].column) 
+        for cell in col:
+            try:
+                content = str(cell.value)
+                if len(content) > max_length:
+                    max_length = len(content)
+            except: pass
+        adjusted_width = (max_length + 2) 
+        if adjusted_width < 10: adjusted_width = 10 
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    ws.auto_filter.ref = ws.dimensions 
+    final_output = io.BytesIO()
+    wb.save(final_output)
+    final_output.seek(0)
+    return final_output
+
+# --- Fim das Funções Helper ---
+
 
 @app.route('/')
 def index():
-    """Renderiza a página inicial para upload (index.html)."""
-    # Renderiza o frontend com o layout simplificado
     return render_template('index.html')
 
 @app.route('/processar', methods=['POST'])
 def processar_arquivos():
     
-    # 1. MAPEAMENTO DE CONTAS (Lógica de preenchimento da coluna 'conta')
     MAPA_CONTA = {
         'Decarion (Monaco Metais)': 'DECARION TORNEIRAS',
         'Gs Torneiras': 'GS TORNEIRAS',
         'Via Flix (Matriz)': 'VIA FLIX'
     }
 
-    # Lista para armazenar todos os DataFrames processados
-    all_processed_dfs = []
-    
-    entry_index = 0
+    COLUNAS_GABARITO_FINAL = [
+        'SKU PRINCIPAL', 'SKU', 'Data da venda', 'EMISSAO', 'N.º de venda', 
+        'origem', '# de anúncio', 'tipo de anuncio', 'Venda por publicidade', 
+        'Forma de entrega', 'Preço unitário de venda do anúncio (BRL)', 
+        'Unidades', 'Receita por produtos (BRL)', 'Envio Seller', 'TARIFA', 
+        'Tarifa de venda e impostos (BRL)', 'conta', 'Estado'
+    ]
 
-    # *** NOVO: DataFrame de referência para custos de SKU/Preço únicos processados ***
-    cost_reference_df = pd.DataFrame()
+    all_processed_dfs = []
+    cost_reference_dict = {} 
+    entry_index = 0
     
     try:
-        # 2. PROCESSA TODOS OS GRUPOS DE UPLOAD ENVIADOS PELO JAVASCRIPT
         while request.form.get(f'marketplace_{entry_index}') is not None:
-            
             marketplace = request.form.get(f'marketplace_{entry_index}')
             conta_selecionada = request.form.get(f'conta_selecionada_{entry_index}')
-            
-            # Aplica a lógica de preenchimento da coluna 'conta'
             conta_final = MAPA_CONTA.get(conta_selecionada, 'OUTRAS')
-            
-            # Pega a lista de arquivos para este grupo específico
             files = request.files.getlist(f'files_{entry_index}[]')
             
             if not files or files[0].filename == '':
                 entry_index += 1
                 continue
 
-            # 3. PROCESSA CADA ARQUIVO NA LISTA
             for file in files:
                 if not file.filename.endswith('.xlsx'):
                     continue 
 
                 data_io = io.BytesIO(file.read())
                 
-                # --- INÍCIO DO PROCESSAMENTO INDIVIDUAL ---
-                
-                # LÊ O ARQUIVO, COM O CABEÇALHO NA LINHA 6 (header=5), 'N.º de venda' como string
-                df = pd.read_excel(data_io, header=5, dtype={'N.º de venda': str})
-                
-                
-                # *** AJUSTE: Renomeação Flexível de Colunas CHAVE (SKU) ANTES DO FILTRO ***
-                df = df.rename(columns={'Tipo de anúncio': 'tipo de anuncio'}, inplace=False) 
-                
-                # Mapeamento de possíveis nomes de SKU para o nome padronizado 'SKU'
-                sku_col_map = {
-                    'Cód. item': 'SKU',
-                    'Cód. do item': 'SKU',
-                    'SKU item': 'SKU',
-                    'SKU da variação': 'SKU', # Típico para Mercado Livre
-                    'Código': 'SKU' # Se for um nome genérico
-                }
-                
-                # Aplica o mapeamento
-                for original, new in sku_col_map.items():
-                    if original in df.columns and new not in df.columns:
-                        df.rename(columns={original: new}, inplace=True)
-                
-                # Garante que a coluna SKU existe para o filtro
-                if 'SKU' not in df.columns:
-                     df['SKU'] = ''
-                # Fim da Renomeação Flexível
-                
-                
-                # *** NOVO FILTRO: REMOVER LINHAS COM STATUS 'CANCELADO' (Reforçado para o nome da coluna) ***
-                
-                # 1. Normaliza os nomes das colunas para minúsculas e remove caracteres especiais
-                df.columns = df.columns.str.strip()
-                # Cria um mapeamento de nomes de colunas normalizados (sem espaços/pontos e em minúsculo)
-                normalized_columns = {col.lower().replace(' ', '').replace('.', '').replace('_', '').replace('#', ''): col for col in df.columns}
-                
-                # Chaves de busca normalizadas
-                STATUS_KEYS_NORMALIZED = ['statusdavenda', 'descriçãodostatus', 'status']
-                
-                # Procura o nome real da coluna no DataFrame
-                status_col_name = next((normalized_columns[key] for key in STATUS_KEYS_NORMALIZED if key in normalized_columns), None)
+                # (Passo 0) Leitura
+                df = pd.read_excel(data_io, header=5, dtype=str)
+                if df.empty: continue
 
-                if status_col_name:
-                    # Filtra: mantém apenas linhas onde o status NÃO contém 'cancel' (case-insensitive)
-                    df = df[~df[status_col_name].astype(str).str.contains('cancel', case=False, na=False)].copy()
-                # Fim do Novo Filtro
-                
-                
-                # *** AJUSTE CRÍTICO: REMOVE A LINHA DE RESUMO DO CARRINHO (SKU VAZIO, MAS N.º DE VENDA PREENCHIDO) ***
-                if not df.empty and 'SKU' in df.columns and 'N.º de venda' in df.columns:
-                    # Filtra: mantém apenas linhas onde o SKU não é vazio/NaN (remove a linha de resumo)
-                    df = df[df['SKU'].astype(str).str.strip().ne('')].copy()
-                
-                # Se o DataFrame ficar vazio após o filtro, pula.
-                if df.empty:
-                    continue
+                # (Passo 1) Limpeza Inicial e Tipagem
+                df.rename(columns={
+                    'Tipo de anúncio': 'tipo de anuncio', 'Cód. item': 'SKU',
+                    'Cód. do item': 'SKU', 'SKU item': 'SKU',
+                    'SKU da variação': 'SKU', 'Código': 'SKU'
+                }, inplace=True)
 
-                # CORREÇÃO CRÍTICA DO NÚMERO DE VENDA
-                df['N.º de venda'] = df['N.º de venda'].apply(
-                    lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() else x
-                )
-                
-                # 4. DEFINIÇÃO DO GABARITO E TRATAMENTO DE RENOMEAÇÕES
-                COLUNAS_GABARITO_FINAL = [
-                    'SKU PRINCIPAL', 'SKU', 'Data da venda', 'EMISSAO', 'N.º de venda', 
-                    'origem', '# de anúncio', 'tipo de anuncio', 'Venda por publicidade', 
-                    'Forma de entrega', 'Preço unitário de venda do anúncio (BRL)', 
-                    'Unidades', 'Receita por produtos (BRL)', 'Envio Seller', 'TARIFA', 
-                    'Tarifa de venda e impostos (BRL)', 'conta', 'Estado'
-                ]
-                
-                df['Forma de entrega'] = df['Forma de entrega'].astype(str).str.strip() 
-                
-                # *** AJUSTE: Propagar dados de cabeçalho do carrinho (BFILL e FFILL) ***
-                cols_to_fill = ['Forma de entrega', 'tipo de anuncio', 'Venda por publicidade', 'Estado']
-                
-                for col in cols_to_fill:
-                    if col in df.columns:
-                        # Passo 1: Converter strings vazias para NaN, garantindo que bfill/ffill funcione.
-                        df[col] = df[col].replace(r'^\s*$', np.nan, regex=True)
-                        
-                        # 2. BFILL: Preenche NaN/vazio para trás (pega o valor de baixo)
-                        df[col] = df.groupby('N.º de venda')[col].bfill()
-                        # 3. FFILL: Preenche NaN/vazio para frente (pega o valor de cima)
-                        df[col] = df.groupby('N.º de venda')[col].ffill()
+                if 'Estado.1' not in df.columns: df['Estado.1'] = ''
 
+                text_cols = ['SKU', 'N.º de venda', 'Forma de entrega', 'Estado', 'Estado.1', 'tipo de anuncio', 'Venda por publicidade', '# de anúncio']
+                for col in text_cols:
+                    if col not in df.columns: df[col] = ''
+                    df[col] = df[col].fillna('').astype(str).str.strip()
+                
+                df['N.º de venda'] = df['N.º de venda'].str.replace(r'\.0$', '', regex=True)
+                
+                decimal_cols = ['Tarifas de envio (BRL)', 'Tarifa de venda e impostos (BRL)', 'TARIFA', 'Preço unitário de venda do anúncio (BRL)', 'Receita por produtos (BRL)']
+                for col in decimal_cols:
+                    if col not in df.columns: df[col] = Decimal('0')
+                    if col == 'Tarifa de venda e impostos (BRL)':
+                         df[col] = Decimal('0')
+                    else:
+                         df[col] = df[col].apply(safe_decimal)
+                    
+                if 'Unidades' not in df.columns: df['Unidades'] = 0
+                df['Unidades'] = pd.to_numeric(df['Unidades'], errors='coerce').fillna(0).astype(int) 
 
-                # DATA
                 try:
                     month_map = { 'janeiro': '01', 'fevereiro': '02', 'março': '03', 'abril': '04', 'maio': '05', 'junho': '06', 'julho': '07', 'agosto': '08', 'setembro': '09', 'outubro': '10', 'novembro': '11', 'dezembro': '12' }
                     dates = df['Data da venda'].astype(str).str.replace(r'\s\d{1,2}:\d{2}\s*hs\.$', '', regex=True).str.strip()
                     for pt_month, num_month in month_map.items():
                         dates = dates.str.replace(f' de {pt_month} de ', f'/{num_month}/', regex=False)
                     df['Data da venda'] = pd.to_datetime(dates, format='%d/%m/%Y', errors='coerce').dt.strftime('%d/%m/%Y')
+                    df['Data da venda'].fillna('', inplace=True)
                 except Exception as e:
-                    print(f"Aviso: Falha na formatação da coluna 'Data da venda'. Erro: {e}")
+                    print(f"Aviso: Falha na formatação da 'Data da venda'. Erro: {e}")
+                    if 'Data da venda' not in df.columns: df['Data da venda'] = ''
 
-                # CONVERSÕES E CÁLCULOS BASE
-                df['Unidades'] = pd.to_numeric(df['Unidades'], errors='coerce').fillna(0)
+                # --- CORREÇÃO (V7.1): Propagação sem Groupby ---
+                # (Passo 2) Propagação de Dados do Carrinho
+                cols_to_propagate = ['Forma de entrega', 'tipo de anuncio', 'Venda por publicidade', 'Estado.1']
+                for col in cols_to_propagate:
+                    if col in df.columns:
+                        # 1. Substitui strings vazias por NaN
+                        df[col] = df[col].replace(r'^\s*$', np.nan, regex=True)
+                        # 2. Aplica ffill (forward fill) para copiar o valor da master (de cima) para os itens (de baixo)
+                        df[col] = df[col].ffill()
+                        # 3. Preenche qualquer NaN restante (ex: se a primeira linha for vazia)
+                        df[col] = df[col].fillna('')
+                # --- FIM DA CORREÇÃO ---
+
+                # (Passo 3) Capturar Custo da Linha Resumo
+                summary_lines_mask = df['SKU'].str.strip() == ''
+
+                # (Passo 4) Deletar Linhas Indesejadas
+                # Usa 'Estado' (Status do Envio, não 'Estado.1') para filtrar "cancel"
+                df = df[~df['Estado'].astype(str).str.contains('cancel', case=False, na=False)].copy()
+                df = df[~summary_lines_mask].copy()
+                if df.empty: continue
                 
-                # Cria uma chave arredondada para a Herança de Custos
-                df['Price_Key'] = pd.to_numeric(df['Preço unitário de venda do anúncio (BRL)'], errors='coerce').fillna(0).round(2)
-                df['Preço unitário de venda do anúncio (BRL)'] = df['Price_Key'] # Usa a chave arredondada
+                df['Preço unitário de venda do anúncio (BRL)'] = df['Preço unitário de venda do anúncio (BRL)'].apply(safe_decimal)
+                df['Receita por produtos (BRL)'] = df['Unidades'].apply(Decimal) * df['Preço unitário de venda do anúncio (BRL)']
+
+                # (Passo 5) Herança de Custos (Somente N e O)
+                df['Price_Key_Decimal'] = df['Preço unitário de venda do anúncio (BRL)'].apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
                 
-                original_freight = pd.to_numeric(df['Tarifas de envio (BRL)'], errors='coerce').fillna(0)
-                original_tax_fee = pd.to_numeric(df['Tarifa de venda e impostos (BRL)'], errors='coerce').fillna(0)
-                
-                # --- NOVO: Herança de Custos (Passo 3.1) - Baseada APENAS em SKU e Preço Unitário ***
-                if not cost_reference_df.empty:
-                    # Prepara a referência para merge
-                    reference = cost_reference_df[['SKU', 'Preço unitário de venda do anúncio (BRL)', 'Envio Seller', 'Tarifa de venda e impostos (BRL)']].copy()
+                if cost_reference_dict: 
+                    ref_data = [
+                        (k[0], k[1], k[2], v[0], v[1]) 
+                        for k, v in cost_reference_dict.items()
+                    ]
+                    ref_df = pd.DataFrame(ref_data, columns=['SKU', 'Price_Key_Decimal', 'Unidades', 'Ref_N', 'Ref_O']) 
                     
-                    # Junta para encontrar custos previamente calculados (Chave: SKU e Price_Key)
-                    df = df.merge(
-                        reference,
-                        left_on=['SKU', 'Price_Key'],
-                        right_on=['SKU', 'Preço unitário de venda do anúncio (BRL)'],
-                        how='left',
-                        suffixes=('', '_ref')
-                    )
-                    
-                    # *** ROBUSTEZ: Garantir que as colunas de referência existam após o merge ***
-                    if 'Envio Seller_ref' not in df.columns:
-                        df['Envio Seller_ref'] = np.nan
-                    if 'Tarifa de venda e impostos (BRL)_ref' not in df.columns:
-                        df['Tarifa de venda e impostos (BRL)_ref'] = np.nan
+                    if not ref_df.empty:
+                        df = df.merge(ref_df, on=['SKU', 'Price_Key_Decimal', 'Unidades'], how='left') 
                         
-                    # *** AJUSTE CRÍTICO NA HERANÇA ***
-                    # Se o frete original for 0 OU o valor herdado for melhor que o atual (para evitar custos zerados em itens principais)
-                    
-                    # Condição para aplicar o custo de Envio Seller herdado:
-                    # 1. Há um valor de referência (Envio Seller_ref não é NaN)
-                    # 2. O frete original é zero (caso de item secundário de carrinho ou item sem custo)
-                    condition_apply_freight_ref = pd.notna(df['Envio Seller_ref']) & (df['Tarifas de envio (BRL)'] == 0)
+                        df['Ref_N'] = df['Ref_N'].fillna(np.nan)
+                        df['Ref_O'] = df['Ref_O'].fillna(np.nan)
+                        
+                        cond_heranca_n = pd.notna(df['Ref_N']) & (df['Ref_N'] > df['Tarifas de envio (BRL)'])
+                        df['Tarifas de envio (BRL)'] = np.where(cond_heranca_n, df['Ref_N'], df['Tarifas de envio (BRL)'])
+                        
+                        cond_heranca_o = pd.notna(df['Ref_O']) & (df['Ref_O'] > df['TARIFA'])
+                        df['TARIFA'] = np.where(cond_heranca_o, df['Ref_O'], df['TARIFA'])
+                        
+                        df.drop(columns=['Ref_N', 'Ref_O'], inplace=True, errors='ignore')
 
-                    df['Tarifas de envio (BRL)'] = np.where(
-                        condition_apply_freight_ref,
-                        df['Envio Seller_ref'],
-                        df['Tarifas de envio (BRL)']
-                    )
-                    
-                    # Aplica o custo de Tarifa de Venda herdado, se existir
-                    df['Tarifa de venda e impostos (BRL)'] = np.where(
-                        pd.notna(df['Tarifa de venda e impostos (BRL)_ref']),
-                        df['Tarifa de venda e impostos (BRL)_ref'],
-                        df['Tarifa de venda e impostos (BRL)']
-                    )
-                    
-                    # Remove colunas de merge
-                    df.drop(columns=['Preço unitário de venda do anúncio (BRL)_ref', 'Envio Seller_ref', 'Tarifa de venda e impostos (BRL)_ref'], inplace=True, errors='ignore')
+                # (Passo 6) Regra < 79 (Pós-Herança N)
+                cond_lt_79 = df['Preço unitário de venda do anúncio (BRL)'] < Decimal('79.00')
+                df['Tarifas de envio (BRL)'] = np.where(cond_lt_79, Decimal('0'), df['Tarifas de envio (BRL)'])
                 
-                df.drop(columns=['Price_Key'], inplace=True, errors='ignore')
-
-                # Se houve herança, atualiza original_freight e original_tax_fee
-                original_freight = df['Tarifas de envio (BRL)']
-                original_tax_fee = df['Tarifa de venda e impostos (BRL)']
-                # Fim da Herança de Custos
+                # (Passo 7) Regra Flex (Pós-Herança O)
+                cond_flex = df['Forma de entrega'] == 'Mercado Envios Flex'
+                cond_flex_high = cond_flex & (df['Preço unitário de venda do anúncio (BRL)'] >= Decimal('79.00'))
+                cond_flex_low = cond_flex & (df['Preço unitário de venda do anúncio (BRL)'] < Decimal('79.00'))
                 
-                # Continua o processamento normal a partir daqui, usando os valores ATUALIZADOS/HERDADOS
-                
-                # Conversão para Decimal para maior precisão
-                original_freight_decimal = original_freight.astype(str).apply(Decimal)
-                unidades_decimal = df['Unidades'].apply(Decimal)
-                
-                df['Tarifas de envio (BRL)'] = original_freight 
-                df['Tarifa de venda e impostos (BRL)'] = original_tax_fee
-                
-                # LÓGICAS COMPLEXAS DE CUSTO (Somente se os valores não foram herdados e precisarem de cálculo)
-                unit_price = df['Preço unitário de venda do anúncio (BRL)']
-                is_flex = df['Forma de entrega'] == 'Mercado Envios Flex'
-                
-                # Condição de Custo Original (apenas quando o custo de envio não é zero E unidades > 0)
-                is_original_cost = (original_freight.abs() > 0) & (df['Unidades'] > 0)
-                
-                # NOVO: Define um conjunto de envios com lógica de custo variável (FULL + Correios/Pontos)
-                shipping_group_logic = ['Mercado Envios Full', 'Correios e pontos de envio', 'Pontos de Envio']
-                is_full_logic_group = df['Forma de entrega'].isin(shipping_group_logic)
-                
-                # MINIMIZAÇÃO DE CUSTO (Custo MÁXIMO = Mais Vantajoso)
-                is_valid_cost = (original_freight.abs() < 100)
-                
-                # *** CORREÇÃO CRÍTICA DO DIVISIONBYZERO (Revisada) ***
-                valid_rows_for_division = is_original_cost & is_valid_cost & (df['Unidades'] > 0)
-                df['Unit_Cost_Temp'] = np.nan 
-
-                safe_division_result = (
-                    original_freight_decimal[valid_rows_for_division] / unidades_decimal[valid_rows_for_division]
-                ).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-                
-                df.loc[valid_rows_for_division, 'Unit_Cost_Temp'] = safe_division_result.astype(float)
-                # Fim da correção do DivisionByZero
-
-                max_cost_group = df.groupby(['SKU', 'Forma de entrega'])['Unit_Cost_Temp'].transform('max')
-                
-                # Converto max_cost_group de volta para Decimal para a próxima multiplicação
-                max_cost_group_decimal = max_cost_group.apply(lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0'))
-
-                max_cost_total = (max_cost_group_decimal * unidades_decimal).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-                
-                sale_counts = df.groupby('N.º de venda')['N.º de venda'].transform('count')
-                
-                # Um sub-item é parte de um carrinho (sale_counts > 1) E tem frete original zero.
-                is_sub_item_to_calculate = (sale_counts > 1) & (original_freight == 0)
-
-                # DEFINIÇÕES FLEX/FULL
-                cost_flex_high_calc = Decimal("-9.11") 
-                cond_flex_high = is_flex & (unit_price >= 79.00) 
-                cost_flex_low_calc = Decimal("-1.10") 
-                cond_flex_low = is_flex & (unit_price <= 78.99) 
-                
-                flex_calculated_cost_unit = np.select(
+                df['TARIFA'] = np.select(
                     [cond_flex_high, cond_flex_low],
-                    [cost_flex_high_calc, cost_flex_low_calc],
-                    default=Decimal("0.00")
-                ) 
-                
-                # CORREÇÃO CRÍTICA DO ZERAMENTO: Se o preço for <= 78.99 E pertencer ao grupo FULL/Logística, FORÇA ZERO.
-                cond_full_force_zero = is_full_logic_group & (unit_price <= 78.99)
-                
-                # *** AJUSTE CRÍTICO DO FLEX: Aplica a lógica FLEX sempre que for Flex E não for um sub-item. ***
-                cond_flex_apply_fixed = is_flex & (~is_sub_item_to_calculate)
-                
-                # *** AJUSTE: Minimização só se aplica se NÃO for um sub-item de carrinho E houver um custo melhor ***
-                cond_apply_best_cost = (~is_sub_item_to_calculate) & (max_cost_total.astype(float) > original_freight) & (original_freight < 0)
-                
-                # Aplica o max_cost_total ao sub-item
-                cond_full_apply_min = is_sub_item_to_calculate & is_full_logic_group
+                    [Decimal('-9.11'), Decimal('-1.10')],
+                    default=df['TARIFA']
+                )
 
-                # ATRIBUIÇÃO FINAL DE CUSTO (np.select)
-                final_cost_decimal_array = np.select(
-                    [
-                        cond_flex_apply_fixed,      # 2. FLEX (Custo Fixo Unitário) - PRIO MÁXIMA PARA FLEX
-                        cond_apply_best_cost,       # 3. CORRIGE O ITEM PRINCIPAL (Minimização)
-                        cond_full_apply_min,        # 4. FULL/GRUPO (Custo Mínimo Total) - APLICA AO SUB-ITEM
-                    ], 
-                    [
-                        flex_calculated_cost_unit,         # Resultado 2: Custo FLEX Unitário (Decimal)
-                        max_cost_total,                    # Resultado 3: Aplica o Custo Mínimo (Decimal)
-                        max_cost_total,                    # Resultado 4: Máximo Histórico Calculado (TOTAL: Decimal) - Aplica ao sub-item
-                    ],
-                    # Fallback: Mantém o valor original (Decimal)
-                    default=original_freight_decimal 
+                # (Passo 7.5) Cálculo da Coluna P (11.5% + Custo Fixo)
+                preco_unit = df['Preço unitário de venda do anúncio (BRL)']
+                
+                cond_fixo_1 = (preco_unit > Decimal('0')) & (preco_unit <= Decimal('12.50'))
+                val_fixo_1 = preco_unit * Decimal('-0.5') 
+                cond_fixo_2 = (preco_unit > Decimal('12.50')) & (preco_unit <= Decimal('29.00'))
+                val_fixo_2 = Decimal('-6.25')
+                cond_fixo_3 = (preco_unit > Decimal('29.00')) & (preco_unit <= Decimal('50.00'))
+                val_fixo_3 = Decimal('-6.50')
+                cond_fixo_4 = (preco_unit > Decimal('50.00')) & (preco_unit < Decimal('79.00'))
+                val_fixo_4 = Decimal('-6.75')
+                
+                custo_fixo_unitario = np.select(
+                    [cond_fixo_1, cond_fixo_2, cond_fixo_3, cond_fixo_4],
+                    [val_fixo_1, val_fixo_2, val_fixo_3, val_fixo_4],
+                    default=Decimal('0') 
                 )
                 
-                # CORREÇÃO DEFINITIVA DO ZERAMENTO: APLICA-SE SE O ITEM ESTAVA NO GRUPO DE ZERAMENTO E O PREÇO ERA BAIXO
-                final_cost_series = pd.Series(final_cost_decimal_array, index=df.index)
+                unidades_decimal = df['Unidades'].apply(Decimal)
+                custo_fixo_total = custo_fixo_unitario * unidades_decimal
+                receita = df['Receita por produtos (BRL)'] 
+                custo_11_5 = receita * Decimal('-0.115')
                 
-                final_cost_series = np.where(
-                    cond_full_force_zero,
-                    Decimal("0.00"),
-                    final_cost_series
+                df['Tarifa de venda e impostos (BRL)'] = (custo_11_5 + custo_fixo_total).apply(
+                     lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 )
-                
-                # 5. LÓGICA DE PRORRATEIO DE FRETE E TARIFA (CARRINHO) - SOBRESCREVE O CUSTO FINAL CALCULADO
-                
-                # Calcula a Receita por Produtos
-                df['Receita por produtos (BRL)'] = (df['Unidades'] * df['Preço unitário de venda do anúncio (BRL)']).round(2)
-                
-                # Converte para Decimal para cálculos de proporção
-                receita_decimal = df['Receita por produtos (BRL)'].apply(Decimal)
-                
-                # Cria colunas temporárias para os totais de custo (Frete e Tarifa de Venda)
-                df['Frete_Calculado_Temp'] = pd.Series(final_cost_series).astype(float).values
-                df['Tarifa_Calculada_Temp'] = df['Tarifa de venda e impostos (BRL)'].astype(float).values
-                
-                # *** AJUSTE DE ROBUSTEZ: Inicializa as colunas de merge para evitar KeyError ***
-                df['total_receita_carrinho'] = np.nan
-                df['total_frete_carrinho'] = np.nan
-                df['total_tax_carrinho'] = np.nan 
-                df['item_count_carrinho'] = np.nan
-                
-                # 5.1. Calcula o total de frete, tarifa e receita por N.º de venda (carrinho)
-                agg_group = df.groupby('N.º de venda').agg(
-                    total_receita=('Receita por produtos (BRL)', 'sum'),
-                    total_frete=('Frete_Calculado_Temp', 'sum'),
-                    total_tax=('Tarifa_Calculada_Temp', 'sum'),
-                    item_count=('N.º de venda', 'count')
-                )
-                
-                # Junta os totais de volta ao DataFrame.
-                df = df.merge(agg_group, on='N.º de venda', suffixes=('', '_carrinho'), how='left')
-                
-                # Remove as colunas temporárias após a agregação
-                df.drop(columns=['Frete_Calculado_Temp', 'Tarifa_Calculada_Temp'], inplace=True, errors='ignore')
 
-                # Prorrateio (aplicado SÓ se for um carrinho E se houver custo/tarifa a ser distribuído)
-                df['item_count_carrinho'] = df['item_count_carrinho'].fillna(0)
-                df['total_frete_carrinho'] = df['total_frete_carrinho'].fillna(0)
-                df['total_receita_carrinho'] = df['total_receita_carrinho'].fillna(0)
-                df['total_tax_carrinho'] = df['total_tax_carrinho'].fillna(0)
+                # (Passo 8) Lógica de Custos do Carrinho
+                # (Removida na V7 - Custos N e O não são mais zerados)
 
-                # Condição para aplicar o PRORRATEIO: Mais de um item no carrinho
-                is_cart_sale = (df['item_count_carrinho'] > 1)
-                
-                if is_cart_sale.any():
-                    # 5.2. Define o fator de prorrogação (Proporcional à Receita)
-                    denominator = df['total_receita_carrinho'].apply(lambda x: x if x != 0 else 1)
-                    prorate_factor = receita_decimal / denominator.apply(Decimal)
-                    
-                    # --- PRORRATEIO DE FRETE ---
-                    total_frete_decimal = df['total_frete_carrinho'].apply(Decimal)
-
-                    prorated_freight = (
-                        prorate_factor * total_frete_decimal
-                    ).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-
-                    # --- PRORRATEIO DE TARIFA DE VENDA E IMPOSTOS ---
-                    total_tax_decimal = df['total_tax_carrinho'].apply(Decimal)
-                    
-                    prorated_tax_fee = (
-                        prorate_factor * total_tax_decimal
-                    ).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-                    
-                    # 5.4. Aplica os valores prorrateados nas linhas do carrinho
-                    final_cost_series = np.where(
-                        is_cart_sale,
-                        prorated_freight,
-                        final_cost_series # Mantém o custo complexo/minimizado original em vendas unitárias
-                    )
-                    
-                    # Aplica a tarifa prorrateada na coluna final de Tarifa de Venda e Impostos
-                    df['Tarifa de venda e impostos (BRL)'] = np.where(
-                        is_cart_sale,
-                        prorated_tax_fee.apply(lambda x: float(x)),
-                        df['Tarifa de venda e impostos (BRL)']
-                    )
-                    
-                df.drop(columns=['total_receita_carrinho', 'total_frete_carrinho', 'total_tax_carrinho', 'item_count_carrinho'], inplace=True, errors='ignore')
-                
-                # 6. CONVERSÃO E ARREDONDAMENTO FINAL (para precisão)
-                final_cost_series = pd.Series(final_cost_series, index=df.index)
-
-                def to_float_exact(val):
-                    if pd.isna(val) or val is None: return 0.0
-                    if isinstance(val, (float, np.float64)): val = Decimal(str(val))
-                    if not isinstance(val, Decimal): return 0.0
-                    
-                    quantized = val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    return float(quantized)
-
-                df['Tarifas de envio (BRL)'] = final_cost_series.apply(to_float_exact)
-                df.drop(columns=['Unit_Cost_Temp'], inplace=True, errors='ignore') 
-
-                # --- REGRAS DE PREENCHIMENTO DO GABARITO ---
-                
-                df['Receita por produtos (BRL)'] = (df['Unidades'] * df['Preço unitário de venda do anúncio (BRL)']).round(2)
-                
-                df['SKU PRINCIPAL'] = df['SKU']
-                
-                df['Envio Seller'] = df['Tarifas de envio (BRL)']
-                df['EMISSAO'] = df['Data da venda']
-                
-                df['origem'] = marketplace 
-                df['conta'] = conta_final 
-
-                df['TARIFA'] = 0 
+                # (Passo 9) Estado Final
                 if 'Estado.1' in df.columns:
                     df['Estado'] = df['Estado.1']
-                
-                COLUNAS_GABARITO_FINAL = [
-                    'SKU PRINCIPAL', 'SKU', 'Data da venda', 'EMISSAO', 'N.º de venda', 
-                    'origem', '# de anúncio', 'tipo de anuncio', 'Venda por publicidade', 
-                    'Forma de entrega', 'Preço unitário de venda do anúncio (BRL)', 
-                    'Unidades', 'Receita por produtos (BRL)', 'Envio Seller', 'TARIFA', 
-                    'Tarifa de venda e impostos (BRL)', 'conta', 'Estado'
-                ]
-                df = df[COLUNAS_GABARITO_FINAL]
-                
-                # 6.1. NOVO: Atualiza a Referência de Custos
-                # Seleciona os custos finais calculados para este arquivo e os adiciona à referência.
-                unique_costs = df.drop_duplicates(subset=['SKU', 'Preço unitário de venda do anúncio (BRL)'])[
-                    ['SKU', 'Preço unitário de venda do anúncio (BRL)', 'Envio Seller', 'Tarifa de venda e impostos (BRL)']
-                ].copy()
+                df.drop(columns=['Estado.1', 'Price_Key_Decimal'], inplace=True, errors='ignore')
 
-                cost_reference_df = pd.concat([cost_reference_df, unique_costs], ignore_index=True).drop_duplicates(
-                    subset=['SKU', 'Preço unitário de venda do anúncio (BRL)'],
-                    keep='first' # Mantém o primeiro custo encontrado para o par (SKU, Preço)
-                )
+                # (Passo 10) Finalização e Conversão para Float
+                df['SKU PRINCIPAL'] = df['SKU']
+                df['Envio Seller'] = df['Tarifas de envio (BRL)']
+                df['EMISSAO'] = df['Data da venda']
+                df['origem'] = marketplace 
+                df['conta'] = conta_final 
+                
+                # (Atualização da Referência de Custos N e O)
+                df_for_ref = df.copy()
+                df_for_ref['Price_Key_Decimal'] = df_for_ref['Preço unitário de venda do anúncio (BRL)'].apply(safe_decimal).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                df_for_ref['Ref_N'] = df_for_ref['Envio Seller'].apply(safe_decimal)
+                df_for_ref['Ref_O'] = df_for_ref['TARIFA'].apply(safe_decimal)
+                
+                for _, row in df_for_ref.iterrows():
+                    key = (row['SKU'], row['Price_Key_Decimal'], row['Unidades']) 
+                    new_costs = (row['Ref_N'], row['Ref_O']) 
 
-                all_processed_dfs.append(df)
+                    if key not in cost_reference_dict:
+                        cost_reference_dict[key] = new_costs
+                    else:
+                        current_costs = cost_reference_dict[key]
+                        best_n = max(current_costs[0], new_costs[0])
+                        best_o = max(current_costs[1], new_costs[1])
+                        cost_reference_dict[key] = (best_n, best_o)
+
+                # Converte para Float (para o Excel)
+                float_cols = ['Envio Seller', 'TARIFA', 'Tarifa de venda e impostos (BRL)', 'Preço unitário de venda do anúncio (BRL)', 'Receita por produtos (BRL)']
+                for col in float_cols:
+                    if col in df.columns:
+                        df[col] = df[col].apply(to_float_exact)
+                df['Unidades'] = df['Unidades'].astype(int) 
+
+                # Garante que todas as colunas do gabarito existam e reordena
+                for col in COLUNAS_GABARITO_FINAL:
+                    if col not in df.columns: df[col] = '' 
+                df_final_file = df.reindex(columns=COLUNAS_GABARITO_FINAL).fillna('')
+                all_processed_dfs.append(df_final_file)
             
-            # Passa para o próximo grupo de upload
             entry_index += 1
             
-        # 4. CONCATENAÇÃO FINAL
+        # 4. CONCATENAÇÃO E ORDENAÇÃO
         if not all_processed_dfs:
             return "Nenhum arquivo válido foi processado.", 400
 
         final_df = pd.concat(all_processed_dfs, ignore_index=True)
-
-        # NOVA LÓGICA: Ordenar por 'conta' e depois por 'SKU PRINCIPAL'
         final_df = final_df.sort_values(by=['conta', 'SKU PRINCIPAL'], ascending=[True, True])
         
-        # 5. SALVAR E FORMATAR (UM ÚNICO ARQUIVO DE SAÍDA)
-        output = io.BytesIO()
-        writer = pd.ExcelWriter(output, engine='openpyxl') 
+        # 5. GERAÇÃO E FORMATAÇÃO DO EXCEL
+        output_stream = io.BytesIO()
+        writer = pd.ExcelWriter(output_stream, engine='openpyxl') 
         final_df.to_excel(writer, index=False, sheet_name='Planilha_Combinada')
-        writer.close()
-        output.seek(0)
+        writer.close() 
+        output_stream.seek(0)
 
-        # 6. AJUSTAR LARGURA DE COLUNAS E APLICAR FILTROS (No arquivo final)
-        wb = load_workbook(output)
-        ws = wb.active 
-        ws.auto_filter.ref = ws.dimensions 
+        # Aplica a formatação openpyxl (conforme helper)
+        final_output_stream = format_excel_output(output_stream)
         
-        for col in ws.columns:
-            max_length = 0
-            column = get_column_letter(col[0].column) 
-            
-            for cell in col:
-                try:
-                    content = str(cell.value)
-                    if len(content) > max_length:
-                        max_length = len(content)
-                except:
-                    pass
-            
-            adjusted_width = (max_length + 2) 
-            if adjusted_width < 10: adjusted_width = 10 
-            ws.column_dimensions[column].width = adjusted_width
-
-        final_output = io.BytesIO()
-        wb.save(final_output)
-        final_output.seek(0)
-        
-        # --- FIM DO PROCESSAMENTO ---
-
-        # 7. Envia o arquivo processado para o download do usuário
+        # 7. Resposta
         return send_file(
-            final_output,
+            final_output_stream,
             as_attachment=True,
-            download_name=f'planilha_combinada.xlsx',
+            download_name='planilha_combinada_formatada.xlsx',
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
             
     except Exception as e:
-        # Se ocorrer um erro durante o processamento de qualquer arquivo
-        return f"<h1>Erro no Processamento</h1><p>Ocorreu um erro inesperado. Detalhes: <b>{e}</b></p><p>Verifique o formato dos arquivos e tente novamente.</p>", 500
+        import traceback
+        print(traceback.format_exc()) # Log completo do erro no console do Flask
+        return f"<h1>Erro no Processamento</h1><p>Ocorreu um erro inesperado. Detalhes: <b>{e}</b></p><p>Verifique o formato dos arquivos e a lógica de processamento.</p>", 500
 
 if __name__ == '__main__':
-    # Inicia o servidor Flask
     app.run(debug=True, host='0.0.0.0')
