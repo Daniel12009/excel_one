@@ -98,11 +98,9 @@
         <form id="uploadForm" action="/processar" method="post" enctype="multipart/form-data">
             
             <div id="upload-entries">
-                <!-- Linhas de upload serão inseridas aqui pelo JavaScript -->
-            </div>
+                </div>
 
             <div class="action-buttons">
-                <!-- Botão para adicionar mais configurações -->
                 <button type="button" id="add-entry" title="Adicionar novo grupo de arquivos">+</button>
             </div>
             
@@ -113,22 +111,17 @@
         <p class="error" id="errorMessage"></p>
     </div>
 
-    <!-- TEMPLATE OCULTO PARA NOVA LINHA DE UPLOAD -->
     <template id="upload-template">
         <div class="upload-row">
-            <!-- 1. Marketplace -->
             <div>
                 <label>Marketplace</label>
                 <select class="marketplace-select" required>
                     <option value="">-- Selecione --</option>
                     <option value="Mercado Livre">Mercado Livre</option>
-                    <option value="Shein">Shein</option>
-                    <option value="Shopee">Shopee</option>
-                    <option value="Amazon">Amazon</option>
+                    <option value="SHOPEE/SHEIN">SHOPEE/SHEIN</option>
                 </select>
             </div>
 
-            <!-- 2. Conta -->
             <div>
                 <label>Conta</label>
                 <select class="conta-select" required>
@@ -139,15 +132,12 @@
                 </select>
             </div>
 
-            <!-- 3. Arquivos -->
             <div>
                 <label>Arquivos Excel (.xlsx)</label>
-                <!-- NOTE: O name será definido dinamicamente pelo JS -->
                 <input type="file" class="file-input" accept=".xlsx" multiple required>
                 <div class="note">Arquivos para este Marketplace/Conta</div>
             </div>
 
-            <!-- Botão de Remover -->
             <div class="action-buttons" style="width: auto;">
                 <button type="button" class="remove-entry" title="Remover grupo de arquivos">X</button>
             </div>
