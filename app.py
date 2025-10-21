@@ -1,4 +1,4 @@
-# app.py (Versão 9 - Lógica de Conta Corrigida)
+# app.py (Versão 10 - Correção Flex e Custo Shein)
 from flask import Flask, render_template, request, send_file, session
 import pandas as pd
 from openpyxl import load_workbook
@@ -160,12 +160,11 @@ def processar_arquivos():
             marketplace = request.form.get(f'marketplace_{entry_index}')
             conta_selecionada = request.form.get(f'conta_selecionada_{entry_index}')
             
-            # --- CORREÇÃO (V9): Lógica de Conta Condicional ---
+            # --- Lógica de Conta Condicional (V9) ---
             if marketplace == 'SHOPEE/SHEIN' and conta_selecionada == 'Decarion (Monaco Metais)':
                 conta_final = 'Via Flix - A Casa das Torneiras'
             else:
                 conta_final = MAPA_CONTA.get(conta_selecionada, 'OUTRAS')
-            # --- FIM DA CORREÇÃO ---
 
             files = request.files.getlist(f'files_{entry_index}[]')
             
@@ -267,15 +266,20 @@ def processar_arquivos():
                     cond_lt_79 = df['Preço unitário de venda do anúncio (BRL)'] < Decimal('79.00')
                     df['Tarifas de envio (BRL)'] = np.where(cond_lt_79, Decimal('0'), df['Tarifas de envio (BRL)'])
                     
-                    # (Passo 7) Regra Flex (Pós-Herança O)
+                    # --- CORREÇÃO (V10): Lógica Flex movida para Coluna N ---
+                    # (Passo 7) Regra Flex (Pós-Herança N)
                     cond_flex = df['Forma de entrega'] == 'Mercado Envios Flex'
                     cond_flex_high = cond_flex & (df['Preço unitário de venda do anúncio (BRL)'] >= Decimal('79.00'))
                     cond_flex_low = cond_flex & (df['Preço unitário de venda do anúncio (BRL)'] < Decimal('79.00'))
-                    df['TARIFA'] = np.select(
+                    
+                    # Aplica a lógica Flex à Coluna N (Tarifas de envio (BRL))
+                    df['Tarifas de envio (BRL)'] = np.select(
                         [cond_flex_high, cond_flex_low],
                         [Decimal('-9.11'), Decimal('-1.10')],
-                        default=df['TARIFA']
+                        default=df['Tarifas de envio (BRL)'] # Mantém o valor do Passo 6 (Regra < 79) ou Passo 5 (Herança)
                     )
+                    # (A lógica que aplicava isso à Coluna O (TARIFA) foi removida)
+                    # --- FIM DA CORREÇÃO ---
 
                     # (Passo 7.5) Cálculo da Coluna P (11.5% + Custo Fixo)
                     preco_unit = df['Preço unitário de venda do anúncio (BRL)']
@@ -311,7 +315,7 @@ def processar_arquivos():
                     df['SKU PRINCIPAL'] = df['SKU']
                     df['Envio Seller'] = df['Tarifas de envio (BRL)']
                     df['EMISSAO'] = df['Data da venda']
-                    df['origem'] = marketplace # (Já é "Mercado Livre")
+                    df['origem'] = marketplace 
                     df['conta'] = conta_final 
                     
                     # (Atualização da Referência de Custos N e O)
@@ -384,12 +388,18 @@ def processar_arquivos():
                     desconto = df['Valor de desconto'].apply(safe_decimal)
                     comissao = df['Comissão e-commerce'].apply(safe_decimal)
                     
+                    # --- CORREÇÃO (V10): Lógica de Custo Shein ---
+                    cond_shein = df['origem'] == 'Shein'
+                    # Aplica -6 para Shein, 0 para Shopee/Outros
+                    envio_seller_tiny = np.where(cond_shein, Decimal('-6.00'), Decimal('0'))
+                    
                     # Aplica Regras de Custo
                     df_final['Preço unitário de venda do anúncio (BRL)'] = preco_unit
                     df_final['Receita por produtos (BRL)'] = preco_total - desconto # Regra 5
-                    df_final['Envio Seller'] = Decimal('0') # Regra 1 e 2
+                    df_final['Envio Seller'] = envio_seller_tiny # <-- LINHA ATUALIZADA
                     df_final['TARIFA'] = Decimal('0') # Regra 1 e 2
                     df_final['Tarifa de venda e impostos (BRL)'] = comissao * Decimal('-1') # Regra 3
+                    # --- FIM DA CORREÇÃO ---
 
                     # (Passo 10) Finalização (atribui df_final a df)
                     df = df_final
